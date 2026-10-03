@@ -1,8 +1,8 @@
 # PSOEffects
 
-A tiny, header-only Arduino library that gives every prop the same LED "feel": a fixed six-color palette, a rainbow mode, and a smooth linear breathing effect for NeoPixel (WS2812-style) strips.
+A header-only Arduino library that gives every prop the same look and sound: a fixed six-color palette, a rainbow mode, and a smooth linear breathing effect for NeoPixel (WS2812-style) strips, plus a bundled set of 16 sound-effect headers (blasts, power-ups, swaps, errors and more) stored as 8-bit PCM arrays.
 
-Write the color logic once, `#include` it in each project, and your props all glow the same way.
+Write the effect logic once, `#include` it in each project, and your props all glow and sound the same way.
 
 ## Features
 
@@ -11,6 +11,7 @@ Write the color logic once, `#include` it in each project, and your props all gl
 - **Linear breathing:** triangle-wave brightness, so the glow fades up and down at a steady rate
 - **Per-channel RGB scaling:** brightness is applied to each color channel, so hues stay true as they dim
 - **One-call dispatcher:** pass a mode index and it picks solid color or rainbow for you
+- **Sound effects:** 16 ready-to-use clips as `const uint8_t` arrays (8 kHz, mono, 8-bit unsigned PCM), one header per sound
 - **Header-only:** no `.cpp` files, nothing to build
 
 ## Requirements
@@ -21,19 +22,27 @@ Write the color logic once, `#include` it in each project, and your props all gl
 ## Installation
 
 1. Download or clone this repository.
-2. Place `PSOEffects.h` in your Arduino libraries folder:
+2. Place `PSOEffects.h` and the `Sound` folder in your Arduino libraries folder:
 
    ```
-   ~/Documents/Arduino/libraries/PSOEffects/PSOEffects.h
+   ~/Documents/Arduino/libraries/PSOEffects/
+   ├── PSOEffects.h
+   └── Sound/
+       ├── blast.h
+       ├── ChargeDone.h
+       └── ...
    ```
 
 3. Restart the Arduino IDE.
-4. Include it in your sketch (after or alongside the NeoPixel include):
+4. Include what you need in your sketch (after or alongside the NeoPixel include):
 
    ```cpp
    #include <Adafruit_NeoPixel.h>
-   #include <PSOEffects.h>
+   #include <PSOEffects.h>        // lighting
+   #include <Sound/blast.h>       // any sound header you want
    ```
+
+   Only the sounds you include are compiled into your sketch, so unused clips cost no flash.
 
 ## Quick start
 
@@ -127,6 +136,80 @@ Draws a moving rainbow across the strip at the given `brightness` and calls `str
 | `PSO_RAINBOW_CYCLE_MS`    | Time for the rainbow to complete one full cycle       | `6000`  |
 | `PSO_RAINBOW_SPAN`        | Number of full hue cycles spread across the strip     | `3`     |
 
+## Sound effects
+
+Each header in `Sound/` defines three things for one clip:
+
+- `<NAME>_SOUND[]`: the samples, as `const uint8_t` (unsigned 8-bit, silence is `128`)
+- `<NAME>_SOUND_LENGTH`: number of samples
+- `<NAME>_SOUND_SAMPLE_RATE`: always `8000` (Hz)
+
+| Header          | Array name         | Length (samples) | Duration |
+|-----------------|--------------------|------------------|----------|
+| `blast.h`       | `BLAST_SOUND`      | 7065             | 0.88 s   |
+| `mechBlast.h`   | `MECHBLAST_SOUND`  | 5216             | 0.65 s   |
+| `rifleBlast.h`  | `RIFLEBLAST_SOUND` | 11307            | 1.41 s   |
+| `HPBeams.h`     | `BEAMS_SOUND`      | 10889            | 1.36 s   |
+| `hit_sound.h`   | `HIT_SOUND`        | 7151             | 0.89 s   |
+| `swing_sound.h` | `SWING_SOUND`      | 4279             | 0.53 s   |
+| `swap_sound.h`  | `SWAP_SOUND`       | 12701            | 1.59 s   |
+| `power_sound.h` | `POWER_SOUND`      | 12167            | 1.52 s   |
+| `powerup.h`     | `POWERUP_SOUND`    | 5108             | 0.64 s   |
+| `Charging.h`    | `CHARGING_SOUND`   | 8010             | 1.00 s   |
+| `ChargeDone.h`  | `CHARGE_DONE_SOUND`| 3581             | 0.45 s   |
+| `InitIntro.h`   | `INIT_INTRO_SOUND` | 3869             | 0.48 s   |
+| `InitOutro.h`   | `INIT_OUTRO_SOUND` | 3853             | 0.48 s   |
+| `ErrorSound1.h` | `ERROR_1_SOUND`    | 4631             | 0.58 s   |
+| `ErrorSound2.h` | `ERROR_2_SOUND`    | 5898             | 0.74 s   |
+| `ErrorSound3.h` | `ERROR_3_SOUND`    | 9380             | 1.17 s   |
+
+All 16 together are about 112 KB of flash.
+
+### Playing a sound
+
+The library stores the audio data only. Playback is up to your sketch and depends on your output hardware (DAC, PWM into an amplifier, I2S, and so on). The sketch below shows a non-blocking pattern: it steps through the samples at the clip's sample rate and hands each one to an `outputSample()` function that you write for your hardware.
+
+```cpp
+#include <Arduino.h>      // must come before the sound headers (they use uint8_t)
+#include <Sound/blast.h>
+
+const uint8_t *playData = nullptr;
+uint32_t playLen = 0, playPos = 0, lastTick = 0, tickUs = 0;
+
+void outputSample(uint8_t s) {
+  // Write one 8-bit sample to your DAC / PWM / I2S here.
+}
+
+void startSound(const uint8_t *data, uint32_t len, uint32_t rate) {
+  playData = data;
+  playLen  = len;
+  playPos  = 0;
+  tickUs   = 1000000UL / rate;   // 125 us at 8 kHz
+  lastTick = micros();
+}
+
+void serviceSound() {            // call as often as possible from loop()
+  if (!playData) return;
+  uint32_t now = micros();
+  if (now - lastTick < tickUs) return;
+  lastTick += tickUs;
+  if (playPos >= playLen) {
+    outputSample(128);           // back to silence
+    playData = nullptr;
+    return;
+  }
+  outputSample(playData[playPos++]);
+}
+
+// Trigger it:
+//   startSound(BLAST_SOUND, BLAST_SOUND_LENGTH, BLAST_SOUND_SAMPLE_RATE);
+```
+
+### Memory notes
+
+- On boards where `const` data stays in flash (most 32-bit ARM boards, ESP32, RP2040), the arrays cost flash only. On classic AVR boards such as the Uno or Nano, plain `const` arrays are copied into RAM and will not fit; those boards would need the arrays moved to `PROGMEM`.
+- Include `<Arduino.h>` (or any Arduino core header) before the sound headers. They use `uint8_t` without including its header themselves.
+
 ## Customizing
 
 All tuning values are plain constants at the top of `PSOEffects.h`. Edit them to change the look for every project that uses the library:
@@ -140,9 +223,10 @@ All tuning values are plain constants at the top of `PSOEffects.h`. Edit them to
 
 - **Brightness is handled by the library.** Don't also call `strip.setBrightness()`, or the two scalings will stack and dim the output.
 - **Each update call ends with `strip.show()`.** Avoid calling `show()` again in the same loop pass.
-- **Keep `loop()` non-blocking.** Breathing is computed from `millis()`, so long `delay()` calls will make the animation stutter.
+- **Keep `loop()` non-blocking.** Breathing is computed from `millis()`, so long `delay()` calls will make the animation stutter. The same goes for sound playback, which needs frequent calls to keep its 8 kHz timing.
+- **NeoPixel updates and audio timing compete.** `strip.show()` briefly disables interrupts while it sends data, so on larger strips it can add small glitches to interrupt-driven audio output.
 - **Timing is based on `millis()`.** After about 49 days of continuous uptime the counter wraps, which can cause a single small jump in the animation phase. It is harmless for typical prop use.
 
 ## License
 
-Add your license here (for example, MIT).
+MIT
