@@ -596,4 +596,4 @@ Also check that only one version of `PSOAudio` exists in the active sketchbook `
 
 ## License
 
-Add the project’s chosen open-source license to a `LICENSE` file and update this section before distributing the library.
+MIT
