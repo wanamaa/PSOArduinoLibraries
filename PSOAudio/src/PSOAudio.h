@@ -32,6 +32,10 @@ enum SoundId : uint8_t {
 // RP2040:
 //   bclkPin = I2S bit-clock pin
 //   dataPin = I2S data pin
+//   (makeI2SPins: Feather RP2040 Prop-Maker)
+//   -- or --
+//   pwmPin  = PWM audio output pin, when the amp takes a PWM/analog
+//   input (makePWMPins: e.g. Photon Drop on a XIAO RP2040)
 //
 // nRF52840:
 //   pwmPin = audio PWM output pin

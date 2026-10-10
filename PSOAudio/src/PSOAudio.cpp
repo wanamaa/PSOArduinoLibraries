@@ -230,11 +230,65 @@ I2S i2sDevice(OUTPUT);
 bool i2sReady = false;
 volatile bool core1Busy = false;
 
+// PWM output mode, for boards whose amplifier takes a PWM/analog input
+// (e.g. Photon Drop's PAM8302 on a XIAO RP2040). Selected in begin() by
+// passing makePWMPins(). I2S mode (Adafruit Feather RP2040 Prop-Maker)
+// is selected by passing makeI2SPins() and is unchanged.
+bool pwmReady = false;
+int pwmAudioPin = -1;
+
+// PWM carrier well above the audio band and above the ~16 kHz corner of
+// the Photon Drop input integrator. analogWriteFreq()/analogWriteRange()
+// apply to all PWM outputs on the RP2040.
+constexpr uint32_t PWM_CARRIER_HZ = 62500UL;
+constexpr uint16_t PWM_RANGE = 256;
+
+// Same gain as the nRF52840 backend: centered * 4 / 32 = centered / 8.
+constexpr int32_t PWM_GAIN_NUMERATOR = 4;
+constexpr int32_t PWM_GAIN_DENOMINATOR = 32;
+
+// Plays one clip on core1 by writing a PWM duty per sample, paced by
+// micros(). Core1 has nothing else to do, so a paced loop is fine.
+// Returns after the clip ends or playGeneration changes.
+void rp2040PwmPlay(const SoundClip &clip, uint16_t generation) {
+  const uint32_t start = micros();
+
+  for (uint32_t i = 0; i < clip.len; i++) {
+    if (generation != playGeneration) {
+      break;
+    }
+
+    // Absolute schedule (no drift), valid for any sample rate.
+    const uint32_t due =
+      (uint32_t)(((uint64_t)i * 1000000ULL) / clip.rate);
+
+    while ((uint32_t)(micros() - start) < due) {
+      // wait for the next sample time
+    }
+
+    int16_t centered = (int16_t)clip.data[i] - 128;
+    int16_t duty = (int16_t)128 + (int16_t)(
+      ((int32_t)centered * PWM_GAIN_NUMERATOR) /
+      PWM_GAIN_DENOMINATOR
+    );
+
+    if (duty < 0) {
+      duty = 0;
+    } else if (duty > 255) {
+      duty = 255;
+    }
+
+    analogWrite(pwmAudioPin, duty);
+  }
+
+  analogWrite(pwmAudioPin, 128); // back to mid-level / silence
+}
+
 // Matches the previous Prop-Maker sketch's gain.
 constexpr int16_t I2S_GAIN = 25;
 
 void rp2040Service() {
-  if (!i2sReady) {
+  if (!i2sReady && !pwmReady) {
     return;
   }
 
@@ -268,6 +322,14 @@ void rp2040Service() {
       clip.len == 0 ||
       clip.rate == 0) {
 
+    core1Busy = false;
+    return;
+  }
+
+  if (pwmReady) {
+    // PWM mode: no I2S setup needed.
+    soundStartCount[id]++;
+    rp2040PwmPlay(clip, generation);
     core1Busy = false;
     return;
   }
@@ -313,8 +375,7 @@ void rp2040Service() {
 // ---------------------------------------------------------------------------
 #if PSOAUDIO_NRF52840
 
-// The nRF52840 TIMER peripheral runs from a 1 MHz timer clock when its
-// prescaler is zero.
+// TIMER1 runs from 16 MHz / 2^PRESCALER. PRESCALER = 4 gives 1 MHz.
 constexpr uint32_t NRF_TIMER_CLOCK_HZ = 1000000UL;
 
 int audioPin = -1;
@@ -329,11 +390,65 @@ volatile bool audioPlaying = false;
 //
 //   centered * 4 / 32 = centered / 8
 //
-constexpr int32_t NRF_GAIN_NUMERATOR = 4;
+constexpr int32_t NRF_GAIN_NUMERATOR = 16;
 constexpr int32_t NRF_GAIN_DENOMINATOR = 32;
 
+// Audio PWM: the nRF52840's NRF_PWM1 peripheral, driven directly.
+//
+// analogWrite() is deliberately NOT used. On the Arduino nRF52 cores its
+// carrier is only ~1 kHz, far too slow for 8 kHz sample playback, and it
+// is not safe to call from an ISR. Here the PWM peripheral free-runs at
+// 16 MHz / 256 = 62.5 kHz, re-reading one duty value from RAM every
+// period. The timer ISR just stores the next duty into that RAM word.
+NRF_PWM_Type *const audioPwm = NRF_PWM1;
+
+#ifndef PSOAUDIO_PWM_COUNTERTOP
+#define PSOAUDIO_PWM_COUNTERTOP 256   // carrier = 16 MHz / COUNTERTOP - default 256
+#endif
+constexpr uint16_t NRF_PWM_COUNTERTOP = PSOAUDIO_PWM_COUNTERTOP;
+
+uint16_t pwmDuty[1] = { 0x8000 | 128 };
+
 inline void nrfWriteDuty(uint8_t duty) {
-  analogWrite(audioPin, duty);
+  pwmDuty[0] = (uint16_t)(0x8000 | ((uint32_t)duty * NRF_PWM_COUNTERTOP / 256));
+}
+
+void nrfPwmBegin(int pin) {
+  audioPwm->ENABLE = 0;
+  audioPwm->TASKS_STOP = 1;
+
+  // Make sure the pin is an output before the PWM takes it over.
+  pinMode(pin, OUTPUT);
+
+  // Arduino pin number -> absolute nRF GPIO number (Adafruit nRF52 core).
+  audioPwm->PSEL.OUT[0] = g_ADigitalPinMap[pin];
+  audioPwm->PSEL.OUT[1] = 0xFFFFFFFFUL;
+  audioPwm->PSEL.OUT[2] = 0xFFFFFFFFUL;
+  audioPwm->PSEL.OUT[3] = 0xFFFFFFFFUL;
+
+  audioPwm->MODE = 0;        // up counter
+  audioPwm->PRESCALER = 0;   // PWM clock 16 MHz. (NOT the TIMER1 prescaler.)
+  audioPwm->COUNTERTOP = NRF_PWM_COUNTERTOP;   // 16 MHz / 256 = 62.5 kHz
+  audioPwm->DECODER = 0;     // common load, refresh-count mode
+
+  pwmDuty[0] = (uint16_t)(0x8000 | (NRF_PWM_COUNTERTOP / 2));
+
+  // Both sequences point at the same one-word buffer. The peripheral only
+  // reads RAM while a sequence is running, so loop forever:
+  //   SEQ0 -> SEQ1 -> (LOOPSDONE short) -> SEQ0 -> ...
+  // Each sequence is one value, re-read every PWM period (REFRESH = 0).
+  for (int i = 0; i < 2; i++) {
+    audioPwm->SEQ[i].PTR = (uint32_t)(uintptr_t)pwmDuty;
+    audioPwm->SEQ[i].CNT = 1;
+    audioPwm->SEQ[i].REFRESH = 0;
+    audioPwm->SEQ[i].ENDDELAY = 0;
+  }
+
+  audioPwm->LOOP = 1;
+  audioPwm->SHORTS = (1UL << 2);   // LOOPSDONE -> SEQSTART[0]
+
+  audioPwm->ENABLE = 1;
+  audioPwm->TASKS_SEQSTART[0] = 1;
 }
 
 // Forward declaration: nrfTimerBegin() uses nrfStop() when the backend
@@ -347,8 +462,7 @@ void nrfTimerBegin(int pin) {
 
   audioPin = pin;
 
-  pinMode(audioPin, OUTPUT);
-  analogWrite(audioPin, 128);
+  nrfPwmBegin(audioPin);
 
   NVIC_DisableIRQ(TIMER1_IRQn);
 
@@ -363,7 +477,7 @@ void nrfTimerBegin(int pin) {
     TIMER_BITMODE_BITMODE_32Bit;
 
   NRF_TIMER1->PRESCALER =
-    0; // 1 MHz timer tick
+    4; // 16 MHz / 2^4 = 1 MHz timer tick
 
   NRF_TIMER1->SHORTS =
     TIMER_SHORTS_COMPARE0_CLEAR_Msk;
@@ -385,7 +499,7 @@ void nrfTimerBegin(int pin) {
   NVIC_ClearPendingIRQ(TIMER1_IRQn);
   NVIC_EnableIRQ(TIMER1_IRQn);
 
-  NRF_TIMER1->TASKS_START = 1;
+  //NRF_TIMER1->TASKS_START = 1;
 }
 
 void nrfStop() {
@@ -401,6 +515,8 @@ void nrfStop() {
   audioPos = 0;
 
   interrupts();
+  
+   NRF_TIMER1->TASKS_STOP = 1;
 
   nrfWriteDuty(128);
 }
@@ -445,6 +561,10 @@ bool nrfStart(uint8_t id) {
   audioLen = clip.len;
   audioPos = 0;
   audioPlaying = true;
+
+   NRF_TIMER1->EVENTS_COMPARE[0] = 0;
+   NRF_TIMER1->TASKS_CLEAR = 1;
+   NRF_TIMER1->TASKS_START = 1;
 
   interrupts();
 
@@ -510,12 +630,11 @@ void nrfTimerIsr() {
       duty = 255;
     }
 
-    // Compatibility implementation retained from the original sketch.
-    // analogWrite() inside an ISR can still cause timing glitches on
-    // real hardware.
+    // Just a RAM store; the PWM peripheral picks it up next period.
     nrfWriteDuty((uint8_t)duty);
   } else {
     audioPlaying = false;
+	NRF_TIMER1->TASKS_STOP = 1;
     nrfWriteDuty(128);
   }
 }
@@ -536,16 +655,32 @@ namespace PSOAudio {
 bool begin(const Pins &pins) {
 #if PSOAUDIO_RP2040
 
-  if (pins.bclkPin < 0 || pins.dataPin < 0) {
-    return false;
+  // I2S pins given: I2S output (Adafruit Feather RP2040 Prop-Maker).
+  if (pins.bclkPin >= 0 && pins.dataPin >= 0) {
+    i2sDevice.setBCLK(pins.bclkPin);
+    i2sDevice.setDATA(pins.dataPin);
+    i2sDevice.setBitsPerSample(16);
+
+    pwmReady = false;
+    i2sReady = true;
+    return true;
   }
 
-  i2sDevice.setBCLK(pins.bclkPin);
-  i2sDevice.setDATA(pins.dataPin);
-  i2sDevice.setBitsPerSample(16);
+  // Only a PWM pin given: PWM output (e.g. Photon Drop on XIAO RP2040).
+  if (pins.pwmPin >= 0) {
+    pwmAudioPin = pins.pwmPin;
 
-  i2sReady = true;
-  return true;
+    pinMode(pwmAudioPin, OUTPUT);
+    analogWriteFreq(PWM_CARRIER_HZ);
+    analogWriteRange(PWM_RANGE);
+    analogWrite(pwmAudioPin, 128);
+
+    i2sReady = false;
+    pwmReady = true;
+    return true;
+  }
+
+  return false;
 
 #elif PSOAUDIO_NRF52840
 
